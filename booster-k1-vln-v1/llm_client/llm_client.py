@@ -1,3 +1,37 @@
+"""
+LLM step: ask the model where to go (Booster K1 VLN).
+
+This file owns the VLN LLM logic:
+  1. the SYSTEM_PROMPT (role + all standing rules: coordinate system, the 3
+     actions, and the JSON output schema),
+  2. build the per-step user text (instruction + memory),
+  3. order the 3 grid views,
+  4. hand system prompt + user text + images to a swappable backend
+     (llm_backend.py) that talks to the model and returns raw text,
+  5. parse that text into the action dict the pipeline expects.
+
+The system prompt lives HERE (not in the pipeline) so pipeline.py stays light,
+and the standing rules sit in the system message - the recommended place for
+stable behavior rules and output schemas.
+
+Swapping LM Studio -> OpenAI is a config change in llm_backend.py; nothing in
+this file changes.
+
+ask_llm(...) returns:
+    {
+      "thought": str,
+      "action":  "move" | "look_behind" | "stop" | "retry",
+      "view":    "front" | "left" | "right",
+      "u": int (0..1000),
+      "v": int (0..1000),
+      "new_planning": [str, ...],
+    }
+A stop made because the reply was unusable also has "invalid_reply": True.
+
+ask_gesture(instruction) is a second, text-only call, made once after a real
+arrival. It returns {"gesture": "nothing" | "dab" | "wave" | "handshake"}.
+"""
+
 from __future__ import annotations
 
 import json
@@ -5,9 +39,9 @@ import math
 import re
 from typing import Optional, Sequence
 
-try:
+try:                     # imported as a package by the pipeline
     from .llm_backend import get_backend
-except ImportError:
+except ImportError:      # run directly: python llm_client.py
     from llm_backend import get_backend
 
 
@@ -17,22 +51,56 @@ VALID_VIEWS = {"front", "left", "right"}
 VALID_GESTURES = {"nothing", "dab", "wave", "handshake"}
 
 
-SYSTEM_PROMPT = """Guide a Booster K1 robot to follow the navigation instruction in order.
-Use the previous plan, recent thoughts, and front/left/right images to track progress.
+# The system prompt: role + all the standing rules. Stable across every step,
+# so it lives in the system message (best practice for behavior rules + output
+# schemas). Per-step content (instruction, memory, images) goes in the user text.
+SYSTEM_PROMPT = """You are the navigation brain of a Booster K1 humanoid robot.
+Each step you look at the scene and choose where the robot should step next so
+it follows the given instruction.
 
-Each step:
-1. Review progress toward the goal.
-2. Choose one action: "move" toward clear floor away from obstacles,
-   "look_behind" if the target is likely behind, or "stop" when near the goal.
-3. Give a brief thought and update the remaining plan.
+WHAT YOU RECEIVE EACH STEP
+- The navigation instruction (the goal).
+- Your previous planning (your own to-do notes) and your recent thoughts.
+  Use them to track progress: you are CONTINUING a task, not starting over.
+- Three camera images: FRONT, LEFT, RIGHT. Each has a coordinate grid drawn on
+  it. There is NO back view.
+- FRONT view is robot head pointing straight at 0 radian (0°). LEFT view is robot head pointing 1 radian (≈57.3°) left. Similarly RIGHT view is robot head pointing 1 radian (≈57.3°) right. 
 
-For "move", select a view and coordinates: u runs left to right, v top to bottom,
-both from 0 to 1000. For other actions, use view="front", u=500, v=500.
+COORDINATE SYSTEM (same on every image)
+- u = horizontal: 0 = left edge, 1000 = right edge.
+- v = vertical:   0 = top (far away), 1000 = bottom (close to the robot).
+- A point with a large v (about 700-900) is floor a short distance ahead.
 
-Return only JSON:
-{"thought": "...", "action": "move|look_behind|stop", "view": "front|left|right", "u": 500, "v": 500, "new_planning": ["..."]}"""
+CHOOSE ONE ACTION
+- "move": walk toward a point. Put "view" (front/left/right) and "u","v" on
+  WALKABLE FLOOR that leads toward the goal. Never pick walls, people, objects,
+  or the ceiling/sky.
+- "look_behind": turn the body 180 degrees to see behind. Use ONLY when the
+  target is likely behind you and is not visible in the three views.
+- "stop": the robot has reached the final destination in the instruction
+  (roughly within 2-3 meters).
+
+RULES
+- Select a point which is far from all obstacles. The robot navigation may have some error so leave some buffer space around so that robot does not move close to obstacles.
+- Do multi-step instructions IN ORDER.
+- If the next turn is conditional or not reached yet, keep moving forward.
+- Keep "thought" to a few short sentences: which area you are in, which view has
+  the target, what your plan says to do next, and whether you are progressing.
+- Put 1-3 short steps in "new_planning" for what to do after this move.
+- Reply with ONLY a JSON object. No extra text, no markdown code fences.
+
+ALWAYS REMEMBER
+- If you find yourself almost near the target, then you can end VLN. No need to be perfectly near the target.
+- If you were asked to walk to a landmark (example : a ladder) and if you find that you have just crossed that landmark then just end the VLN. This means that you are already near the landmark and it is fine to end the VLN there. No need to move/turn around in such a situation.
+
+JSON FORMAT
+{"thought": "...", "action": "move|look_behind|stop", "view": "front|left|right", "u": 0-1000, "v": 0-1000, "new_planning": ["...", "..."]}
+
+For "look_behind" and "stop", still include view/u/v (any valid numbers) - they
+are ignored for those actions."""
 
 
+# The gesture prompt: used once, after the robot reaches the goal. Text only.
 GESTURE_SYSTEM_PROMPT = """You choose the gesture a Booster K1 humanoid robot performs after it reaches
 the goal of a navigation instruction.
 
@@ -65,6 +133,8 @@ def _format_list(items: Sequence[str]) -> str:
 
 def build_user_text(instruction: str, planning: Sequence[str],
                     thought_history: Sequence[str]) -> str:
+    """Assemble the per-step user text (dynamic content only; rules are in the
+    system prompt)."""
     return (
         "[Instruction]\n"
         f"{instruction}\n\n"
@@ -81,6 +151,16 @@ def build_user_text(instruction: str, planning: Sequence[str],
 def ask_llm(grid_images: dict, instruction: str,
             planning: Optional[Sequence[str]] = None,
             thought_history: Optional[Sequence[str]] = None) -> dict:
+    """Ask the model for the next action.
+
+    Args:
+        grid_images: {view_name: BGR grid image}, keys among front/left/right.
+        instruction: the natural-language navigation goal.
+        planning: the model's planning notes from the previous step.
+        thought_history: the model's recent thoughts (verbatim, oldest first).
+    Returns:
+        The action dict documented at the top of this file.
+    """
     user_text = build_user_text(instruction, planning or [], thought_history or [])
     images = [(f"{name.upper()} VIEW", grid_images[name])
               for name in VIEW_ORDER if name in grid_images]
@@ -88,7 +168,10 @@ def ask_llm(grid_images: dict, instruction: str,
     return parse_response(raw_text)
 
 
+# ----------------------------- response parsing ----------------------------
+
 def _coordinate(value):
+    # Check the original number BEFORE rounding: -0.1 and 1000.1 are invalid.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     if not 0 <= value <= 1000 or not math.isfinite(value):
@@ -97,8 +180,12 @@ def _coordinate(value):
 
 
 def _extract_json(raw_text: str) -> Optional[dict]:
+    """Return the JSON object in a non-empty model reply, or None.
+
+    Strips markdown code fences and tolerates prose around the object.
+    """
     text = raw_text.strip()
-    if text.startswith("```"):
+    if text.startswith("```"):                        # strip ```json ... ``` fences
         text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
         text = re.sub(r"\n?```$", "", text).strip()
 
@@ -106,7 +193,7 @@ def _extract_json(raw_text: str) -> Optional[dict]:
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
+        match = re.search(r"\{.*\}", text, re.DOTALL)  # grab the outermost {...}
         if match:
             try:
                 data = json.loads(match.group(0))
@@ -116,11 +203,24 @@ def _extract_json(raw_text: str) -> Optional[dict]:
 
 
 def _safe_stop(reason: str) -> dict:
+    """Fallback when we cannot trust the model output: stop instead of moving.
+
+    "invalid_reply" marks that the robot did NOT reach the goal, so the pipeline
+    must not treat this stop as arrival. A stop chosen by the model has no such key.
+    """
     return {"thought": reason, "action": "stop", "view": "front",
             "u": 500, "v": 500, "new_planning": [], "invalid_reply": True}
 
 
 def parse_response(raw_text: Optional[str]) -> dict:
+    """Turn the model's raw reply into the validated action dict.
+
+    Defensive on purpose: strips markdown fences, tolerates surrounding prose,
+    rejects invalid move coordinates with an internal 'retry' action.
+    Malformed JSON, unknown actions, and invalid views still stop navigation.
+    A move must explicitly name a valid view and finite coordinates; never
+    invent a center/front target when the model omits or corrupts those fields.
+    """
     if not raw_text or not raw_text.strip():
         return _safe_stop("Empty response from model; stopping for safety.")
 
@@ -162,7 +262,13 @@ def parse_response(raw_text: Optional[str]) -> dict:
     }
 
 
+# ------------------------------ gesture choice ------------------------------
+
 def ask_gesture(instruction: str) -> dict:
+    """Ask the model which gesture the instruction requests (text only, no images).
+
+    Returns {"gesture": "nothing" | "dab" | "wave" | "handshake"}.
+    """
     user_text = (
         "[Instruction]\n"
         f"{instruction}\n\n"
@@ -173,6 +279,11 @@ def ask_gesture(instruction: str) -> dict:
 
 
 def parse_gesture_response(raw_text: Optional[str]) -> dict:
+    """Turn the model's raw reply into {"gesture": name}.
+
+    An empty reply, a reply without a JSON object, or an unknown gesture gives
+    "nothing": when we cannot trust the output, the arms do not move.
+    """
     if not raw_text or not raw_text.strip():
         return {"gesture": "nothing"}
     data = _extract_json(raw_text)
@@ -185,6 +296,10 @@ def parse_gesture_response(raw_text: Optional[str]) -> dict:
 
 
 if __name__ == "__main__":
+    # Component test:
+    #   1) Offline - print exactly what we would send (no server needed).
+    #   2) Parse self-test - prove fence stripping and coordinate rejection work.
+    #   3) Live - if LM Studio is running with a VLM loaded, do a real call.
     import glob
     from pathlib import Path
 

@@ -1,3 +1,5 @@
+"""One interrupt per navigation run, with final cleanup protected."""
+
 import signal
 
 
@@ -15,6 +17,7 @@ class NavigationInterrupt:
 
 
 def begin_navigation_cleanup() -> None:
+    """Protect cleanup when running under the server's interrupt handler."""
     handler = signal.getsignal(signal.SIGINT)
     if isinstance(handler, NavigationInterrupt):
         handler.cleaning_up = True

@@ -1,3 +1,5 @@
+"""Run one instruction in the navigation process and report its final outcome."""
+
 import argparse
 import json
 import signal
@@ -10,12 +12,14 @@ from navigation_interrupt import NavigationInterrupt
 
 
 def run_navigation(instruction: str, result_path: Path, navigate: Callable[[str], None]) -> int:
+    """Write the result only after the pipeline returns or unwinds its cleanup."""
     result = {"status": "completed", "message": ""}
     exit_code = 0
     interrupt = NavigationInterrupt()
     previous_handler = signal.signal(signal.SIGINT, interrupt)
     try:
         try:
+            # The parent must not signal us during imports or handler setup.
             result_path.with_suffix(".ready").touch()
             navigate(instruction)
             if interrupt.requested:

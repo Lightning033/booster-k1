@@ -1,3 +1,12 @@
+"""HTTP entry point for STT. Run one server process, with one worker and no reload.
+
+POST /command accepts {"command_id": "...", "text": "..."} immediately.
+POST /stop requests interruption; repeated requests do not interrupt cleanup.
+GET /status reports idle, running, stopping, completed, cancelled, or failed.
+Normal shutdown waits for the current navigation run, including its cleanup.
+Server shutdown does not yet request cancellation. This is not an emergency stop.
+"""
+
 import asyncio
 import json
 import logging
@@ -26,14 +35,15 @@ class Command(BaseModel):
 
 
 class NavigationProcessError(RuntimeError):
-    pass
+    """A child process failure whose message is already suitable for STT."""
 
 
 class NavigationCancelled(Exception):
-    pass
+    """Navigation ended after an operator's stop request."""
 
 
 class NavigationProcess:
+    """Run the pipeline in a fresh interpreter and wait for its final result."""
 
     def __init__(self, worker_path: Path = ROOT / "vln_worker.py"):
         self._worker_path = worker_path.resolve()
@@ -43,6 +53,8 @@ class NavigationProcess:
             raise NavigationCancelled("Navigation stopped before starting.")
         with tempfile.TemporaryDirectory(prefix="k1-vln-") as directory:
             result_path = Path(directory) / "result.json"
+            # A separate session prevents terminal interrupts reaching the child
+            # directly. Only the monitor sends SIGINT, once the worker is ready.
             with subprocess.Popen(
                 [sys.executable, "-u", str(self._worker_path),
                  "--result", str(result_path), "--", text],
@@ -81,6 +93,7 @@ class NavigationProcess:
 
 
 class NavigationRunner:
+    """Own one active run and its status; never queue a second instruction."""
 
     def __init__(self, navigate: Callable[[str], None]):
         self._navigate = navigate
@@ -129,6 +142,7 @@ class NavigationRunner:
             status, message = "failed", str(exc)
             LOGGER.error("VLN failed %s: %s", command_id, message)
         except BaseException as exc:
+            # Even a worker's SystemExit/KeyboardInterrupt must release the busy state.
             status, message = "failed", f"{type(exc).__name__}: {exc}"
             LOGGER.exception("VLN failed %s", command_id)
         finally:
@@ -138,6 +152,7 @@ class NavigationRunner:
         LOGGER.info("VLN %s: %s", status, command_id)
 
     def stop(self) -> dict:
+        """Request one interrupt; the monitor owns signal delivery and reaping."""
         with self._lock:
             if self._state["status"] == "running":
                 if not isinstance(self._navigate, NavigationProcess):
@@ -155,11 +170,12 @@ class NavigationRunner:
             return {**self._state, "elapsed_s": elapsed}
 
     def close(self) -> None:
+        """Reject further commands and wait for navigation to finish its cleanup."""
         with self._lock:
             self._closing = True
             worker = self._thread
         if worker is not None:
-            worker.join()
+            worker.join()  # Never hold the state lock while waiting for the worker.
 
 
 @asynccontextmanager
@@ -183,6 +199,7 @@ def stop(request: Request) -> dict:
 
 
 def create_app(navigate: Optional[Callable[[str], None]] = None) -> FastAPI:
+    """Inject a fake navigation function for offline HTTP tests."""
     application = FastAPI(title="Booster K1 VLN", lifespan=lifespan)
     application.state.runner = NavigationRunner(navigate if navigate is not None else NavigationProcess())
     application.add_api_route("/command", command, methods=["POST"])

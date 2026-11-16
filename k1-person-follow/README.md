@@ -362,3 +362,23 @@ names are shown on the page instead.
 
 ICT Capstone project, University of Adelaide (PG-S2-43), with the AIML Robotics
 Lab.
+
+---
+
+## Model files
+
+Three model files are needed and are **not** in this repository — they are
+third-party weights, and together they are about 45 MB.
+
+| File | Where it goes | Source |
+| --- | --- | --- |
+| `yolov8n.pt` | `detect_person/` | ultralytics; downloaded on first use, or copied from a machine that has it |
+| `face_detection_yunet_2023mar.onnx` | `recognize_face/models/` | OpenCV Zoo |
+| `face_recognition_sface_2021dec.onnx` | `recognize_face/models/` | OpenCV Zoo |
+
+The lab network has no internet, so copy them onto the workstation beforehand
+rather than relying on a download at run time.
+
+`face_db/people/` is also absent by design: it holds photographs and biometric
+embeddings of real people and must never be committed. It is created the first
+time someone is enrolled.

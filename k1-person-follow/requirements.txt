@@ -1,0 +1,17 @@
+# Booster K1 person follow — Python packages.
+#
+# NOT installable with pip, and must already be present:
+#   ROS2 Humble            source /opt/ros/humble/setup.bash
+#   rclpy, sensor_msgs     come with ROS2
+#   booster_robotics_sdk_python
+#
+# OpenCV must be the full build, not -headless: the --window option and the
+# FaceDetectorYN / FaceRecognizerSF classes both come from it.
+opencv-python>=4.8
+numpy>=1.24
+ultralytics>=8.0
+
+# ByteTrack needs this for its assignment step. ultralytics auto-installs it
+# from the network on the first track() call, which fails on a machine with no
+# internet — so it is pinned here to be installed in advance.
+lap>=0.5

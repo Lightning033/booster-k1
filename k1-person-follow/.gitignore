@@ -1,0 +1,14 @@
+# Enrolled people: photographs and biometric embeddings of real people.
+# Never commit this. Removing it in a later commit does not remove it
+# from the history.
+face_db/people/*
+!face_db/people/.gitkeep
+
+# Model weights: downloaded, not authored here. See the README.
+*.onnx
+*.pt
+!recognize_face/models/.gitkeep
+
+__pycache__/
+*.pyc
+runs/
